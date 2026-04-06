@@ -43,16 +43,14 @@ def get_driver():
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-gpu")
     opts.add_argument("--window-size=1920,1080")
-
-    # Anti-bot-detection flags
     opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_argument("--disable-extensions")
     opts.add_argument(
         "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     )
-    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-    opts.add_experimental_option("useAutomationExtension", False)
+    # NOTE: no add_experimental_option — unsupported by Chromium on Linux, causes crashes
 
     # Streamlit Cloud (Ubuntu) paths
     for binary in ["/usr/bin/chromium", "/usr/bin/chromium-browser"]:
@@ -74,10 +72,6 @@ def get_driver():
         except Exception:
             driver = webdriver.Chrome(options=opts)
 
-    # Mask navigator.webdriver so the site can't detect automation
-    driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
-        "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-    })
     return driver
 
 
@@ -85,26 +79,44 @@ def search_location(driver, location: str, log):
     """Open nadlan.gov.il and search for the given location."""
     driver.get("https://www.nadlan.gov.il/")
 
-    # Wait for the Vue/React SPA to fully render
+    # Wait for document to be fully loaded
     log("Waiting for page to load…")
-    search_input = WebDriverWait(driver, 30).until(
-        EC.presence_of_element_located((By.ID, "myInput2"))
+    WebDriverWait(driver, 30).until(
+        lambda d: d.execute_script("return document.readyState") == "complete"
     )
-    time.sleep(1.5)  # let the SPA settle
+    time.sleep(3)  # extra wait for the Vue/React SPA to mount
 
-    # Type slowly so the autosuggest event fires properly
+    # --- DEBUG: show screenshot so we can see what loaded ---
+    st.image(driver.get_screenshot_as_png(), caption="Page after load (debug)")
+
+    # Find the search input
+    try:
+        search_input = WebDriverWait(driver, 20).until(
+            EC.presence_of_element_located((By.ID, "myInput2"))
+        )
+    except Exception:
+        # Show page source snippet to diagnose
+        with st.expander("Page source (debug)"):
+            st.code(driver.page_source[:5000])
+        raise RuntimeError("Search input (id=myInput2) not found — see debug info above.")
+
+    time.sleep(0.5)
     search_input.click()
     for char in location:
         search_input.send_keys(char)
-        time.sleep(0.08)
+        time.sleep(0.1)
     log(f"Typed: {location}")
 
     # Wait for react-autosuggest suggestions list to appear
-    suggestion = WebDriverWait(driver, 10).until(
-        EC.element_to_be_clickable((By.CSS_SELECTOR, "li.react-autosuggest__suggestion"))
-    )
-    log(f"Suggestions appeared — clicking first one…")
-    suggestion.click()
+    try:
+        suggestion = WebDriverWait(driver, 10).until(
+            EC.element_to_be_clickable((By.CSS_SELECTOR, "li.react-autosuggest__suggestion"))
+        )
+        suggestion.click()
+        log("Suggestion selected.")
+    except Exception:
+        st.image(driver.get_screenshot_as_png(), caption="After typing (debug)")
+        raise RuntimeError("No autocomplete suggestions appeared — see screenshot above.")
 
     # Wait for results table
     log("Waiting for results table…")
