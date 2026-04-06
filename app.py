@@ -66,58 +66,23 @@ def get_driver():
 def search_location(driver, location: str, log):
     """Open nadlan.gov.il and search for the given location."""
     driver.get("https://www.nadlan.gov.il/")
-    time.sleep(2)
 
-    # Find the search input (try several selectors)
-    search_input = None
-    for by, sel in [
-        (By.ID,          "searchInput"),
-        (By.CSS_SELECTOR, "input[type='search']"),
-        (By.CSS_SELECTOR, "input[placeholder]"),
-        (By.CSS_SELECTOR, "input[type='text']"),
-    ]:
-        try:
-            els = driver.find_elements(by, sel)
-            if els:
-                search_input = els[0]
-                break
-        except Exception:
-            continue
-
-    if not search_input:
-        raise RuntimeError(
-            "Could not find search input on nadlan.gov.il — "
-            "the site structure may have changed."
-        )
+    # Wait for the react-autosuggest input (id="myInput2")
+    log("Waiting for search box…")
+    search_input = WebDriverWait(driver, 20).until(
+        EC.presence_of_element_located((By.ID, "myInput2"))
+    )
 
     search_input.clear()
     search_input.send_keys(location)
-    time.sleep(1.5)
+    log(f"Typed: {location}")
 
-    # Click first autocomplete suggestion if one appears
-    clicked = False
-    for by, sel in [
-        (By.CSS_SELECTOR, "li.ui-menu-item"),
-        (By.CSS_SELECTOR, "[class*='autocomplete'] li"),
-        (By.CSS_SELECTOR, "[class*='suggest'] li"),
-        (By.CSS_SELECTOR, "[class*='dropdown'] li"),
-        (By.CSS_SELECTOR, "[class*='result'] li"),
-    ]:
-        try:
-            items = WebDriverWait(driver, 3).until(
-                EC.presence_of_all_elements_located((by, sel))
-            )
-            if items:
-                items[0].click()
-                clicked = True
-                log("Autocomplete suggestion selected.")
-                break
-        except Exception:
-            continue
-
-    if not clicked:
-        search_input.send_keys(Keys.RETURN)
-        log("Submitted search with Enter.")
+    # Wait for react-autosuggest suggestions to appear
+    suggestion = WebDriverWait(driver, 10).until(
+        EC.element_to_be_clickable((By.CSS_SELECTOR, "li.react-autosuggest__suggestion"))
+    )
+    suggestion.click()
+    log("Suggestion selected.")
 
     # Wait for results table
     log("Waiting for results table…")
