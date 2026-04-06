@@ -6,9 +6,9 @@ import traceback
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 # ── Config ────────────────────────────────────────────────────────────────────
-MAX_PAGES   = 99
 COORDS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "coordinates.csv")
 
 HEADERS = [
@@ -38,7 +38,7 @@ def load_coords():
         ["Gush_Helka", "X", "Y"]
     ]
 
-# ── Scraping (Playwright) ─────────────────────────────────────────────────────
+# ── Scraping ──────────────────────────────────────────────────────────────────
 def scrape(location: str, max_pages: int, log) -> tuple[list, int, str]:
     from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
@@ -57,44 +57,58 @@ def scrape(location: str, max_pages: int, log) -> tuple[list, int, str]:
 
         # ── Navigate ──────────────────────────────────────────────────────────
         log("Opening nadlan.gov.il…")
-        page.goto("https://www.nadlan.gov.il/", timeout=30_000)
-        page.wait_for_load_state("networkidle", timeout=30_000)
+        page.goto("https://www.nadlan.gov.il/", timeout=60_000)
+        # Use domcontentloaded (faster) + explicit wait for SPA to mount
+        page.wait_for_load_state("domcontentloaded", timeout=30_000)
+        page.wait_for_timeout(6_000)   # give Vue/React time to render
 
         # ── Search ────────────────────────────────────────────────────────────
-        log("Waiting for search box…")
-        page.wait_for_selector("#myInput2", timeout=30_000)
+        log("Looking for search box…")
+        try:
+            page.wait_for_selector("#myInput2", state="visible", timeout=60_000)
+        except PWTimeout:
+            raise RuntimeError(
+                "Search box did not appear within 60 s. "
+                "The site may be blocking headless browsers."
+            )
+
         page.click("#myInput2")
-        page.type("#myInput2", location, delay=80)   # slow typing triggers autosuggest
+        page.type("#myInput2", location, delay=80)
         log(f"Typed: {location}")
 
         # ── Pick first suggestion ─────────────────────────────────────────────
         try:
-            page.wait_for_selector("li.react-autosuggest__suggestion", timeout=10_000)
+            page.wait_for_selector(
+                "li.react-autosuggest__suggestion", state="visible", timeout=10_000
+            )
             page.click("li.react-autosuggest__suggestion")
             log("Suggestion selected.")
         except PWTimeout:
             raise RuntimeError(
-                "No autocomplete suggestions appeared for this location. "
-                "Try a different spelling."
+                "No autocomplete suggestions appeared. "
+                "Check the spelling — use Hebrew exactly as on nadlan.gov.il."
             )
 
         # ── Wait for results table ────────────────────────────────────────────
         log("Waiting for results table…")
-        page.wait_for_selector("#dealsTable", timeout=30_000)
+        try:
+            page.wait_for_selector("#dealsTable", state="visible", timeout=30_000)
+        except PWTimeout:
+            raise RuntimeError("Results table did not load. Try again.")
 
         try:
             location_name = page.text_content(".locationLink").strip().replace(" ", "_")
         except Exception:
             location_name = location.replace(" ", "_")
 
-        log(f"Location confirmed: {location_name}")
+        log(f"Location: {location_name}")
 
         # ── Scrape pages ──────────────────────────────────────────────────────
         rows_data = []
         page_num  = 1
 
         while page_num <= max_pages:
-            rows = page.query_selector_all("#dealsTable tbody tr")
+            rows      = page.query_selector_all("#dealsTable tbody tr")
             page_rows = 0
             for row in rows:
                 cells  = row.query_selector_all("td")
@@ -105,14 +119,13 @@ def scrape(location: str, max_pages: int, log) -> tuple[list, int, str]:
 
             log(f"Page {page_num} — {page_rows} rows  (total: {len(rows_data)})")
 
-            # Check next button
             next_btn = page.query_selector("#next")
             if not next_btn:
                 break
 
-            classes    = next_btn.get_attribute("class") or ""
+            classes     = next_btn.get_attribute("class") or ""
             is_disabled = next_btn.get_attribute("disabled")
-            style      = (next_btn.get_attribute("style") or "").replace(" ", "")
+            style       = (next_btn.get_attribute("style") or "").replace(" ", "")
 
             if (
                 "disabled" in classes.lower()
@@ -121,7 +134,6 @@ def scrape(location: str, max_pages: int, log) -> tuple[list, int, str]:
             ):
                 break
 
-            # Capture first cell text before click to detect page change
             try:
                 prev_first = page.query_selector(
                     "#dealsTable tbody tr td"
@@ -165,7 +177,7 @@ def process(rows_data: list) -> pd.DataFrame:
         df["Transaction Date"] = pd.to_datetime(df["Transaction Date"], errors="coerce")
 
     if "Parcel" in df.columns:
-        parts = df["Parcel"].str.split("-", expand=True)
+        parts   = df["Parcel"].str.split("-", expand=True)
         df["_p1"] = pd.to_numeric(parts[0], errors="coerce")
         df["_p2"] = pd.to_numeric(parts[1], errors="coerce")
         df["Gush_Helka"] = (
@@ -184,7 +196,9 @@ def process(rows_data: list) -> pd.DataFrame:
             ct.str[:6].str.replace("%", "").str.strip(), errors="coerce"
         )
         df["Number_of_years"]     = pd.to_numeric(
-            ct.str[-9:].str.replace(r"[\u05e9\u05e0\u05d9\u05dd\u05d1]", "", regex=True).str.strip(),
+            ct.str[-9:].str.replace(
+                r"[\u05e9\u05e0\u05d9\u05dd\u05d1]", "", regex=True
+            ).str.strip(),
             errors="coerce",
         )
         df["Percentage_Per_Year"] = df["Percentage"] / df["Number_of_years"]
@@ -204,59 +218,90 @@ def merge_coords(df: pd.DataFrame, coords_df) -> pd.DataFrame:
     return pd.merge(df, coords_df, on="Gush_Helka", how="left")
 
 
-# ── UI ────────────────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Nadlan Scraper", page_icon="🏠", layout="centered")
+# ── Page layout ───────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="Nadlan Scraper",
+    page_icon="🏠",
+    layout="wide",
+)
+
+_install_browser()
+coords_df = load_coords()
+
 st.title("🏠 Nadlan.gov.il Scraper")
-st.caption("Automated real estate data extractor")
 
-_install_browser()   # runs once, cached
+left, right = st.columns([1, 1], gap="large")
 
-with st.form("search_form"):
-    location  = st.text_input(
-        "Location (Hebrew)",
-        placeholder="e.g.  רמת אביב",
-        help="Type the location name in Hebrew as it appears on nadlan.gov.il",
+# ── Left column — controls ────────────────────────────────────────────────────
+with left:
+    st.subheader("Controls")
+    st.markdown(
+        """
+        **How to use:**
+        1. Search for your location on the site → (right panel)
+        2. Wait until the results table appears
+        3. Type the **same location name** below and click **Start Scraping**
+        """
     )
-    max_pages = st.slider("Max pages to scrape", 1, 99, 99)
-    submitted = st.form_submit_button("▶  Start Scraping", type="primary")
 
-if submitted and location.strip():
-    coords_df = load_coords()
+    with st.form("search_form"):
+        location  = st.text_input(
+            "Location name (Hebrew)",
+            placeholder="e.g.  רמת אביב",
+        )
+        max_pages = st.slider("Max pages to scrape", 1, 99, 99)
+        submitted = st.form_submit_button("▶  Start Scraping", type="primary")
 
-    try:
-        with st.status("Scraping in progress…", expanded=True) as status:
-            def log(msg: str):
-                st.write(msg)
+    if submitted and location.strip():
+        try:
+            with st.status("Scraping in progress…", expanded=True) as status:
+                def log(msg: str):
+                    st.write(msg)
 
-            rows_data, pages, location_name = scrape(location.strip(), max_pages, log)
+                rows_data, pages, location_name = scrape(
+                    location.strip(), max_pages, log
+                )
 
-            log(f"Processing {len(rows_data)} rows…")
-            df = process(rows_data)
+                log(f"Processing {len(rows_data)} rows…")
+                df = process(rows_data)
 
-            log("Merging coordinates…")
-            df = merge_coords(df, coords_df)
+                log("Merging coordinates…")
+                df = merge_coords(df, coords_df)
 
-            status.update(
-                label=f"Done — {len(df):,} rows from {pages} page(s)",
-                state="complete",
+                status.update(
+                    label=f"Done — {len(df):,} rows from {pages} page(s)",
+                    state="complete",
+                )
+
+            st.success(f"**{len(df):,} rows** scraped from **{pages} page(s)**")
+            st.dataframe(df, use_container_width=True)
+
+            now       = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M")
+            filename  = f"{location_name}_{now}.csv"
+            csv_bytes = df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+
+            st.download_button(
+                "⬇  Download CSV",
+                data=csv_bytes,
+                file_name=filename,
+                mime="text/csv",
+                type="primary",
             )
 
-        st.success(f"**{len(df):,} rows** scraped from **{pages} page(s)**")
-        st.dataframe(df, use_container_width=True)
+        except Exception as exc:
+            st.error(f"**Error:** {exc}")
+            with st.expander("Details"):
+                st.code(traceback.format_exc())
 
-        now       = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M")
-        filename  = f"{location_name}_{now}.csv"
-        csv_bytes = df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
-
-        st.download_button(
-            "⬇  Download CSV",
-            data=csv_bytes,
-            file_name=filename,
-            mime="text/csv",
-            type="primary",
-        )
-
-    except Exception as exc:
-        st.error(f"**Error:** {exc}")
-        with st.expander("Details"):
-            st.code(traceback.format_exc())
+# ── Right column — embedded website ──────────────────────────────────────────
+with right:
+    st.subheader("nadlan.gov.il")
+    st.markdown(
+        "[Open in new tab ↗](https://www.nadlan.gov.il/){target='_blank'}",
+        unsafe_allow_html=True,
+    )
+    components.iframe(
+        "https://www.nadlan.gov.il/",
+        height=700,
+        scrolling=True,
+    )
