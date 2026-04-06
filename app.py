@@ -1,30 +1,33 @@
 import os
-import time
+import sys
+import subprocess
 import datetime
 import traceback
 
 import pandas as pd
 import streamlit as st
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
 
 # ── Config ────────────────────────────────────────────────────────────────────
-MAX_PAGES      = 99
-WAIT_SECONDS   = 0.8
-COORDS_FILE    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "coordinates.csv")
+MAX_PAGES   = 99
+COORDS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "coordinates.csv")
 
 HEADERS = [
     "Serial Number", "Address", "Area (sqm)", "Transaction Date",
     "Transaction Price", "Parcel", "Property Type", "Rooms", "Floor", "Change Trend",
 ]
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Install Playwright browser once per container lifetime ────────────────────
+@st.cache_resource(show_spinner="Installing browser (first run only)…")
+def _install_browser():
+    result = subprocess.run(
+        [sys.executable, "-m", "playwright", "install", "chromium"],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Browser install failed:\n{result.stderr}")
+    return True
 
+# ── Coordinates ───────────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner="Loading coordinates…")
 def load_coords():
     if not os.path.exists(COORDS_FILE):
@@ -35,160 +38,118 @@ def load_coords():
         ["Gush_Helka", "X", "Y"]
     ]
 
+# ── Scraping (Playwright) ─────────────────────────────────────────────────────
+def scrape(location: str, max_pages: int, log) -> tuple[list, int, str]:
+    from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-def get_driver():
-    opts = Options()
-    opts.add_argument("--headless=new")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--disable-gpu")
-    opts.add_argument("--window-size=1920,1080")
-    opts.add_argument("--disable-blink-features=AutomationControlled")
-    opts.add_argument("--disable-extensions")
-    opts.add_argument(
-        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    )
-    # NOTE: no add_experimental_option — unsupported by Chromium on Linux, causes crashes
-
-    # Streamlit Cloud (Ubuntu) paths
-    for binary in ["/usr/bin/chromium", "/usr/bin/chromium-browser"]:
-        if os.path.exists(binary):
-            opts.binary_location = binary
-            break
-
-    driver = None
-    for driver_path in ["/usr/bin/chromedriver", "/usr/lib/chromium/chromedriver",
-                        "/usr/lib/chromium-browser/chromedriver"]:
-        if os.path.exists(driver_path):
-            driver = webdriver.Chrome(service=Service(driver_path), options=opts)
-            break
-
-    if driver is None:
-        try:
-            from webdriver_manager.chrome import ChromeDriverManager
-            driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opts)
-        except Exception:
-            driver = webdriver.Chrome(options=opts)
-
-    return driver
-
-
-def search_location(driver, location: str, log):
-    """Open nadlan.gov.il and search for the given location."""
-    driver.get("https://www.nadlan.gov.il/")
-
-    # Wait for document to be fully loaded
-    log("Waiting for page to load…")
-    WebDriverWait(driver, 30).until(
-        lambda d: d.execute_script("return document.readyState") == "complete"
-    )
-    time.sleep(3)  # extra wait for the Vue/React SPA to mount
-
-    # --- DEBUG: show screenshot so we can see what loaded ---
-    st.image(driver.get_screenshot_as_png(), caption="Page after load (debug)")
-
-    # Find the search input
-    try:
-        search_input = WebDriverWait(driver, 20).until(
-            EC.presence_of_element_located((By.ID, "myInput2"))
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
         )
-    except Exception:
-        # Show page source snippet to diagnose
-        with st.expander("Page source (debug)"):
-            st.code(driver.page_source[:5000])
-        raise RuntimeError("Search input (id=myInput2) not found — see debug info above.")
-
-    time.sleep(0.5)
-    search_input.click()
-    for char in location:
-        search_input.send_keys(char)
-        time.sleep(0.1)
-    log(f"Typed: {location}")
-
-    # Wait for react-autosuggest suggestions list to appear
-    try:
-        suggestion = WebDriverWait(driver, 10).until(
-            EC.element_to_be_clickable((By.CSS_SELECTOR, "li.react-autosuggest__suggestion"))
-        )
-        suggestion.click()
-        log("Suggestion selected.")
-    except Exception:
-        st.image(driver.get_screenshot_as_png(), caption="After typing (debug)")
-        raise RuntimeError("No autocomplete suggestions appeared — see screenshot above.")
-
-    # Wait for results table
-    log("Waiting for results table…")
-    WebDriverWait(driver, 30).until(
-        EC.presence_of_element_located((By.ID, "dealsTable"))
-    )
-
-
-def scrape_all_pages(driver, max_pages: int, log):
-    rows_data = []
-    page = 1
-
-    while page <= max_pages:
-        table = driver.find_element(By.ID, "dealsTable")
-        tbody = table.find_element(By.TAG_NAME, "tbody")
-        rows  = tbody.find_elements(By.TAG_NAME, "tr")
-
-        page_rows = 0
-        for row in rows:
-            cells  = row.find_elements(By.TAG_NAME, "td")
-            values = [c.text.strip() for c in cells[: len(HEADERS)]]
-            if any(values):
-                rows_data.append(values)
-                page_rows += 1
-
-        log(f"Page {page} — {page_rows} rows  (total: {len(rows_data)})")
-
-        # Check for next button
-        try:
-            next_btn = driver.find_element(By.ID, "next")
-        except Exception:
-            break
-
-        classes  = next_btn.get_attribute("class") or ""
-        disabled = next_btn.get_attribute("disabled")
-        style    = next_btn.get_attribute("style") or ""
-
-        if (
-            not next_btn.is_enabled()
-            or "disabled" in classes.lower()
-            or disabled is not None
-            or "display:none" in style.replace(" ", "")
-        ):
-            break
-
-        try:
-            prev_first = rows[0].find_elements(By.TAG_NAME, "td")[0].text.strip()
-        except Exception:
-            prev_first = ""
-
-        driver.execute_script("arguments[0].scrollIntoView();", next_btn)
-        driver.execute_script("arguments[0].click();", next_btn)
-        time.sleep(WAIT_SECONDS)
-
-        WebDriverWait(driver, 15).until(
-            lambda d: (
-                d.find_element(By.ID, "dealsTable")
-                 .find_element(By.TAG_NAME, "tbody")
-                 .find_elements(By.TAG_NAME, "tr")[0]
-                 .find_elements(By.TAG_NAME, "td")[0]
-                 .text.strip()
-            ) != prev_first
+        page = browser.new_page(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            )
         )
 
-        page += 1
+        # ── Navigate ──────────────────────────────────────────────────────────
+        log("Opening nadlan.gov.il…")
+        page.goto("https://www.nadlan.gov.il/", timeout=30_000)
+        page.wait_for_load_state("networkidle", timeout=30_000)
 
-    return rows_data, page
+        # ── Search ────────────────────────────────────────────────────────────
+        log("Waiting for search box…")
+        page.wait_for_selector("#myInput2", timeout=30_000)
+        page.click("#myInput2")
+        page.type("#myInput2", location, delay=80)   # slow typing triggers autosuggest
+        log(f"Typed: {location}")
+
+        # ── Pick first suggestion ─────────────────────────────────────────────
+        try:
+            page.wait_for_selector("li.react-autosuggest__suggestion", timeout=10_000)
+            page.click("li.react-autosuggest__suggestion")
+            log("Suggestion selected.")
+        except PWTimeout:
+            raise RuntimeError(
+                "No autocomplete suggestions appeared for this location. "
+                "Try a different spelling."
+            )
+
+        # ── Wait for results table ────────────────────────────────────────────
+        log("Waiting for results table…")
+        page.wait_for_selector("#dealsTable", timeout=30_000)
+
+        try:
+            location_name = page.text_content(".locationLink").strip().replace(" ", "_")
+        except Exception:
+            location_name = location.replace(" ", "_")
+
+        log(f"Location confirmed: {location_name}")
+
+        # ── Scrape pages ──────────────────────────────────────────────────────
+        rows_data = []
+        page_num  = 1
+
+        while page_num <= max_pages:
+            rows = page.query_selector_all("#dealsTable tbody tr")
+            page_rows = 0
+            for row in rows:
+                cells  = row.query_selector_all("td")
+                values = [c.inner_text().strip() for c in cells[: len(HEADERS)]]
+                if any(values):
+                    rows_data.append(values)
+                    page_rows += 1
+
+            log(f"Page {page_num} — {page_rows} rows  (total: {len(rows_data)})")
+
+            # Check next button
+            next_btn = page.query_selector("#next")
+            if not next_btn:
+                break
+
+            classes    = next_btn.get_attribute("class") or ""
+            is_disabled = next_btn.get_attribute("disabled")
+            style      = (next_btn.get_attribute("style") or "").replace(" ", "")
+
+            if (
+                "disabled" in classes.lower()
+                or is_disabled is not None
+                or "display:none" in style
+            ):
+                break
+
+            # Capture first cell text before click to detect page change
+            try:
+                prev_first = page.query_selector(
+                    "#dealsTable tbody tr td"
+                ).inner_text().strip()
+            except Exception:
+                prev_first = ""
+
+            next_btn.scroll_into_view_if_needed()
+            next_btn.click()
+
+            page.wait_for_function(
+                """(prev) => {
+                    const td = document.querySelector('#dealsTable tbody tr td');
+                    return td && td.innerText.trim() !== prev;
+                }""",
+                arg=prev_first,
+                timeout=15_000,
+            )
+
+            page_num += 1
+
+        browser.close()
+        return rows_data, page_num, location_name
 
 
+# ── Data processing ───────────────────────────────────────────────────────────
 def process(rows_data: list) -> pd.DataFrame:
     df = pd.DataFrame(rows_data, columns=HEADERS)
-
     df = df.drop(columns=["Serial Number"], errors="ignore")
 
     if "Transaction Price" in df.columns:
@@ -215,8 +176,8 @@ def process(rows_data: list) -> pd.DataFrame:
     if "Change Trend" in df.columns:
         ct = (
             df["Change Trend"].astype(str)
-            .str.replace("green arrow up",   "", regex=False)
-            .str.replace("tooltip 16 copy",  "", regex=False)
+            .str.replace("green arrow up",  "", regex=False)
+            .str.replace("tooltip 16 copy", "", regex=False)
         )
         df["Change Trend"]        = ct
         df["Percentage"]          = pd.to_numeric(
@@ -244,46 +205,30 @@ def merge_coords(df: pd.DataFrame, coords_df) -> pd.DataFrame:
 
 
 # ── UI ────────────────────────────────────────────────────────────────────────
-
 st.set_page_config(page_title="Nadlan Scraper", page_icon="🏠", layout="centered")
-
 st.title("🏠 Nadlan.gov.il Scraper")
 st.caption("Automated real estate data extractor")
 
+_install_browser()   # runs once, cached
+
 with st.form("search_form"):
-    location = st.text_input(
+    location  = st.text_input(
         "Location (Hebrew)",
         placeholder="e.g.  רמת אביב",
-        help="Type the location exactly as it appears on nadlan.gov.il",
+        help="Type the location name in Hebrew as it appears on nadlan.gov.il",
     )
     max_pages = st.slider("Max pages to scrape", 1, 99, 99)
     submitted = st.form_submit_button("▶  Start Scraping", type="primary")
 
 if submitted and location.strip():
     coords_df = load_coords()
-    driver    = None
 
     try:
         with st.status("Scraping in progress…", expanded=True) as status:
-
             def log(msg: str):
                 st.write(msg)
 
-            log("Opening headless browser…")
-            driver = get_driver()
-
-            log(f"Searching for:  {location}")
-            search_location(driver, location.strip(), log)
-
-            try:
-                loc_el        = driver.find_element(By.CLASS_NAME, "locationLink")
-                location_name = loc_el.text.strip().replace(" ", "_")
-            except Exception:
-                location_name = location.strip().replace(" ", "_")
-
-            log(f"Location confirmed: {location_name}")
-            log("Scraping pages…")
-            rows_data, pages = scrape_all_pages(driver, max_pages, log)
+            rows_data, pages, location_name = scrape(location.strip(), max_pages, log)
 
             log(f"Processing {len(rows_data)} rows…")
             df = process(rows_data)
@@ -296,12 +241,11 @@ if submitted and location.strip():
                 state="complete",
             )
 
-        # ── Results ───────────────────────────────────────────────────────────
         st.success(f"**{len(df):,} rows** scraped from **{pages} page(s)**")
         st.dataframe(df, use_container_width=True)
 
-        now      = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M")
-        filename = f"{location_name}_{now}.csv"
+        now       = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M")
+        filename  = f"{location_name}_{now}.csv"
         csv_bytes = df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
 
         st.download_button(
@@ -316,10 +260,3 @@ if submitted and location.strip():
         st.error(f"**Error:** {exc}")
         with st.expander("Details"):
             st.code(traceback.format_exc())
-
-    finally:
-        if driver:
-            try:
-                driver.quit()
-            except Exception:
-                pass
