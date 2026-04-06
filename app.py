@@ -44,45 +44,67 @@ def get_driver():
     opts.add_argument("--disable-gpu")
     opts.add_argument("--window-size=1920,1080")
 
+    # Anti-bot-detection flags
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_argument(
+        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    )
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("useAutomationExtension", False)
+
     # Streamlit Cloud (Ubuntu) paths
     for binary in ["/usr/bin/chromium", "/usr/bin/chromium-browser"]:
         if os.path.exists(binary):
             opts.binary_location = binary
             break
 
+    driver = None
     for driver_path in ["/usr/bin/chromedriver", "/usr/lib/chromium/chromedriver",
                         "/usr/lib/chromium-browser/chromedriver"]:
         if os.path.exists(driver_path):
-            return webdriver.Chrome(service=Service(driver_path), options=opts)
+            driver = webdriver.Chrome(service=Service(driver_path), options=opts)
+            break
 
-    # Local fallback — Selenium 4.6+ manager or webdriver-manager
-    try:
-        from webdriver_manager.chrome import ChromeDriverManager
-        return webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opts)
-    except Exception:
-        return webdriver.Chrome(options=opts)
+    if driver is None:
+        try:
+            from webdriver_manager.chrome import ChromeDriverManager
+            driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opts)
+        except Exception:
+            driver = webdriver.Chrome(options=opts)
+
+    # Mask navigator.webdriver so the site can't detect automation
+    driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+        "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+    })
+    return driver
 
 
 def search_location(driver, location: str, log):
     """Open nadlan.gov.il and search for the given location."""
     driver.get("https://www.nadlan.gov.il/")
 
-    # Wait for the react-autosuggest input (id="myInput2")
-    log("Waiting for search box…")
-    search_input = WebDriverWait(driver, 20).until(
+    # Wait for the Vue/React SPA to fully render
+    log("Waiting for page to load…")
+    search_input = WebDriverWait(driver, 30).until(
         EC.presence_of_element_located((By.ID, "myInput2"))
     )
+    time.sleep(1.5)  # let the SPA settle
 
-    search_input.clear()
-    search_input.send_keys(location)
+    # Type slowly so the autosuggest event fires properly
+    search_input.click()
+    for char in location:
+        search_input.send_keys(char)
+        time.sleep(0.08)
     log(f"Typed: {location}")
 
-    # Wait for react-autosuggest suggestions to appear
+    # Wait for react-autosuggest suggestions list to appear
     suggestion = WebDriverWait(driver, 10).until(
         EC.element_to_be_clickable((By.CSS_SELECTOR, "li.react-autosuggest__suggestion"))
     )
+    log(f"Suggestions appeared — clicking first one…")
     suggestion.click()
-    log("Suggestion selected.")
 
     # Wait for results table
     log("Waiting for results table…")
